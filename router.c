@@ -10,6 +10,11 @@
 #define ICMP_DEST_UNREACH 3
 #define ICMP_ECHO 8
 #define ICMP_ECHO_REPLY 0
+#define ARP_REQUEST 1
+#define ARP_REPLY 2
+#define ARP_ETHERNET 1
+
+uint8_t broadcastMAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 struct route_table_entry *getNextHop(uint32_t ip_dest, struct route_table_entry *rtable, int rtable_len)
 {
@@ -124,6 +129,40 @@ void sendICMP(int errcode, char *buf, int interface, struct ether_header *eth_hd
     }
 }
 
+void sendARPrequest(char* buf, int interface, size_t len, uint32_t destIP) {
+    //initializing the ARP packet buffer
+    char* arpBuffer = malloc(sizeof(struct ether_header) + sizeof(struct arp_header));
+
+    //constructing the ethernet header
+    struct ether_header* eth_hdr = malloc(sizeof(struct ether_header));
+    memcpy(eth_hdr->ether_dhost, broadcastMAC, 6);
+    get_interface_mac(interface, eth_hdr->ether_shost);
+    eth_hdr->ether_type = htons(ETHERTYPE_ARP);
+
+    //constructing the ARP header
+    struct arp_header* arp_hdr = malloc(sizeof(struct arp_header));
+    arp_hdr->htype = htons(ARP_ETHERNET);
+    arp_hdr->ptype = htons(ETHERTYPE_IP);
+    arp_hdr->hlen = 6;
+    arp_hdr->plen = sizeof(u_int32_t);
+    arp_hdr->op = htons(ARP_REQUEST);
+    memcpy(arp_hdr->sha, eth_hdr->ether_shost, 6);
+    arp_hdr->spa = inet_addr(get_interface_ip(interface));
+    memcpy(arp_hdr->tha, eth_hdr->ether_dhost, 6);
+    arp_hdr->tpa = destIP;
+
+    //constructing the ARP request packet
+    int ofst = 0;
+    memcpy(arpBuffer, eth_hdr, sizeof(struct ether_header));
+    ofst += sizeof(struct ether_header);
+    memcpy(arpBuffer + ofst, arp_hdr, sizeof(struct arp_header));
+    ofst += sizeof(struct arp_header);
+
+    //sending the packet forward
+    send_to_link(interface, arpBuffer, ofst);
+
+}
+
 int main(int argc, char *argv[])
 {
     char buf[MAX_PACKET_LEN];
@@ -133,10 +172,13 @@ int main(int argc, char *argv[])
     int rtable_len = read_rtable(argv[1], rtable);
 
     // initializing the ARP table
-    struct arp_table_entry *ARPtable = malloc(10 * sizeof(struct arp_table_entry));
-    int arptable_len = parse_arp_table("arp_table.txt", ARPtable);
+    // struct arp_table_entry *ARPtable = malloc(10 * sizeof(struct arp_table_entry));
+    // int arptable_len = parse_arp_table("arp_table.txt", ARPtable);
+    struct arp_table_entry* ARPtable = malloc(10 * sizeof(struct arp_table_entry));
+    int arptable_len = 0;
 
-    uint8_t broadcastMAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    //initializing the packet queue
+    queue packetQueue = queue_create();
 
     // Do not modify this line
     init(argc - 2, argv + 2);
@@ -147,14 +189,14 @@ int main(int argc, char *argv[])
         int interface;
         size_t len;
 
-        // printf("packet received!!!\n");
-        // fflush(NULL);
+        printf("packet received on interface %d!!!\n", interface);
+        fflush(NULL);
 
         interface = recv_from_any_link(buf, &len);
         DIE(interface < 0, "recv_from_any_links");
 
         // packets ignored if too short
-        if (sizeof(buf) < sizeof(struct ether_header) + sizeof(struct iphdr))
+        if (sizeof(buf) < sizeof(struct ether_header))
         {
             memset(buf, 0, sizeof(buf));
             continue;
@@ -185,6 +227,13 @@ int main(int argc, char *argv[])
         // IPv4 packet
         if (etherType == ntohs(0x0800))
         {
+            // packets ignored if too short
+            if (sizeof(buf) < sizeof(struct ether_header) + sizeof(struct iphdr))
+            {
+                memset(buf, 0, sizeof(buf));
+                continue;
+            }
+            
             // printf("ajunge aici\n");
             // identifying IP header
             struct iphdr *ip_hdr = (struct iphdr *)(buf + sizeof(struct ether_header));
@@ -237,15 +286,27 @@ int main(int argc, char *argv[])
             // updating checksum
             ip_hdr->check = ~(~oldChecksum + ~((uint16_t)oldTTL) + (uint16_t)ip_hdr->ttl) - 1;
 
-            // rewriting the ethernet header
-            // memcpy(eth_hdr->ether_shost, hostMAC, 6);
-            memcpy(eth_hdr->ether_dhost, getNextHopMAC(nextHop->next_hop, ARPtable, arptable_len)->mac, sizeof(eth_hdr->ether_dhost));
-            eth_hdr->ether_type = ntohs(0x0800);
+            // case if destination MAC is in cache
+            if (getNextHopMAC(destIP, ARPtable, arptable_len) != NULL) {
+                //rewriting the ethernet header
+                memcpy(eth_hdr->ether_dhost, getNextHopMAC(destIP, ARPtable, arptable_len), 6);
+                eth_hdr->ether_type = ntohs(0x0800);
+                get_interface_mac(nextHop->interface, eth_hdr->ether_shost);
 
-            get_interface_mac(nextHop->interface, eth_hdr->ether_shost);
+                // sending the packet forward
+                send_to_link(nextHop->interface, buf, len);
+            }
+            //case if destination MAC is not in cache
+            else {
+                printf("trimite ARP request pe interfata %d\n", nextHop->interface);
+                fflush(NULL);
+                //enqueueing the packet
+                queue_enq(packetQueue, buf);
 
-            // sending the packet forward
-            send_to_link(nextHop->interface, buf, len);
+                //sending an ARP request to obtain destination MAC
+                sendARPrequest(buf, nextHop->interface, len, nextHop->next_hop);
+                continue;
+            }
         }
 
         // ARP packet
