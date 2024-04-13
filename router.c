@@ -1,6 +1,7 @@
 #include "queue.h"
 #include "lib.h"
 #include "protocols.h"
+#include "list.h"
 #include <arpa/inet.h>
 #include <string.h>
 
@@ -14,8 +15,10 @@
 #define ARP_REPLY 2
 #define ARP_ETHERNET 1
 
+//MAC address for broadcast
 uint8_t broadcastMAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+//returns route table entry of next hop, NULL if it does not exist
 struct route_table_entry *getNextHop(uint32_t ip_dest, struct route_table_entry *rtable, int rtable_len)
 {
     struct route_table_entry *nextHop = NULL;
@@ -36,11 +39,12 @@ struct route_table_entry *getNextHop(uint32_t ip_dest, struct route_table_entry 
     return nextHop;
 }
 
+//returns the MAC table entry of next hop, NULL if MAC address is not found in cache
 struct arp_table_entry *getNextHopMAC(uint32_t ip_dest, struct arp_table_entry *ARPtable, int arptable_len)
 {
     int i;
     for (i = 0; i < arptable_len; i++)
-        if (ARPtable[i].ip == ip_dest)
+        if (ntohs(ARPtable[i].ip) == ip_dest)
             return &ARPtable[i];
 
     return NULL;
@@ -56,8 +60,6 @@ void sendICMP(int errcode, char *buf, int interface, struct ether_header *eth_hd
 
     if (errcode == ICMP_ECHO_REPLY)
     {
-        //get_interface_mac(interface, eth_hdr->ether_shost);
-
         //swapping the MAC addresses
         uint8_t auxMAC[6];
         memcpy(auxMAC, eth_hdr->ether_dhost, sizeof(eth_hdr->ether_dhost));
@@ -100,7 +102,7 @@ void sendICMP(int errcode, char *buf, int interface, struct ether_header *eth_hd
         // modifying the IP header
         iphdr->protocol = IPPROTO_ICMP;
         iphdr->tot_len = htons(sizeof(struct iphdr) + sizeof(struct icmphdr));
-        iphdr->ttl = 255;
+        iphdr->ttl = 64;
         iphdr->check = 0;
         iphdr->check = checksum((uint16_t *)iphdr, sizeof(struct iphdr));
 
@@ -163,6 +165,25 @@ void sendARPrequest(char* buf, int interface, size_t len, uint32_t destIP) {
 
 }
 
+void sendARPreply(char* buf, size_t len, int interface) {
+    //modifying the ethernet header
+    struct ether_header* eth_hdr = (struct ether_header*)buf;
+    memcpy(eth_hdr->ether_dhost, eth_hdr->ether_shost, 6);
+    get_interface_mac(interface, eth_hdr->ether_shost);
+    
+    //modifying the ARP header
+    struct arp_header* arp_hdr = (struct arp_header*)(buf + sizeof(struct ether_header));
+    arp_hdr->op = htons(ARP_REPLY);
+    memcpy(arp_hdr->sha, eth_hdr->ether_shost, 6);
+    memcpy(arp_hdr->tha, eth_hdr->ether_dhost, 6);
+    uint32_t auxIP = arp_hdr->spa;
+    arp_hdr->spa = arp_hdr->tpa;
+    arp_hdr->tpa = auxIP;
+
+    //sending the packet forward
+    send_to_link(interface, buf, len);
+}
+
 int main(int argc, char *argv[])
 {
     char buf[MAX_PACKET_LEN];
@@ -172,8 +193,6 @@ int main(int argc, char *argv[])
     int rtable_len = read_rtable(argv[1], rtable);
 
     // initializing the ARP table
-    // struct arp_table_entry *ARPtable = malloc(10 * sizeof(struct arp_table_entry));
-    // int arptable_len = parse_arp_table("arp_table.txt", ARPtable);
     struct arp_table_entry* ARPtable = malloc(10 * sizeof(struct arp_table_entry));
     int arptable_len = 0;
 
@@ -189,14 +208,11 @@ int main(int argc, char *argv[])
         int interface;
         size_t len;
 
-        printf("packet received on interface %d!!!\n", interface);
-        fflush(NULL);
-
         interface = recv_from_any_link(buf, &len);
         DIE(interface < 0, "recv_from_any_links");
 
         // packets ignored if too short
-        if (sizeof(buf) < sizeof(struct ether_header))
+        if (len < sizeof(struct ether_header))
         {
             memset(buf, 0, sizeof(buf));
             continue;
@@ -234,7 +250,6 @@ int main(int argc, char *argv[])
                 continue;
             }
             
-            // printf("ajunge aici\n");
             // identifying IP header
             struct iphdr *ip_hdr = (struct iphdr *)(buf + sizeof(struct ether_header));
             uint32_t *hostIP = (uint32_t *)get_interface_ip(interface);
@@ -244,7 +259,7 @@ int main(int argc, char *argv[])
             uint16_t oldChecksum = ip_hdr->check;
             ip_hdr->check = 0;
             if (oldChecksum != htons(checksum((uint16_t *)ip_hdr, sizeof(struct iphdr))))
-            {
+            {   
                 memset(buf, 0, sizeof(buf));
                 continue;
             }
@@ -277,10 +292,10 @@ int main(int argc, char *argv[])
             struct route_table_entry *nextHop = getNextHop(ip_hdr->daddr, rtable, rtable_len);
             if (nextHop == NULL)
             {
+                // send ICMP message (destination unreachable)
                 sendICMP(ICMP_DEST_UNREACH, buf, interface, eth_hdr, ip_hdr, len);
                 memset(buf, 0, sizeof(buf));
                 continue;
-                // send ICMP message (destination unreachable)
             }
 
             // updating checksum
@@ -298,10 +313,10 @@ int main(int argc, char *argv[])
             }
             //case if destination MAC is not in cache
             else {
-                printf("trimite ARP request pe interfata %d\n", nextHop->interface);
-                fflush(NULL);
                 //enqueueing the packet
-                queue_enq(packetQueue, buf);
+                char* queueBuf = malloc(sizeof(buf));
+                memcpy(queueBuf, buf, sizeof(buf));
+                queue_enq(packetQueue, queueBuf);
 
                 //sending an ARP request to obtain destination MAC
                 sendARPrequest(buf, nextHop->interface, len, nextHop->next_hop);
@@ -310,10 +325,59 @@ int main(int argc, char *argv[])
         }
 
         // ARP packet
-        if (etherType == ntohs(0x0806))
-        {
-            memset(buf, 0, sizeof(buf));
-            continue;
+        if (etherType == htons(0x0806))
+        {   
+            //identifying the ARP header
+            struct arp_header* arp_hdr = (struct arp_header*)(buf + sizeof(struct ether_header));
+
+            //parsing ARP request
+            if (arp_hdr->op == ntohs(ARP_REQUEST)) {
+                //send ARP reply if IP address matches host
+                if (arp_hdr->tpa == inet_addr(get_interface_ip(interface))) {
+                    sendARPreply(buf, len, interface);
+                    continue;
+                } //otherwise throw packet away
+                else {
+                    memset(buf, 0, sizeof(buf));
+                    continue;
+                }
+            }
+
+            //parsing ARP reply
+            if (arp_hdr->op == ntohs(ARP_REPLY)) {
+                //adding source's MAC address to ARP cache
+                ARPtable[arptable_len].ip = arp_hdr->spa;
+                memcpy(ARPtable[arptable_len].mac, arp_hdr->sha, 6);
+                arptable_len++;
+
+                //auxiliary queue that retains dequeued elements
+                queue auxQueue = queue_create();
+                
+                //inspecting the queue for packets needed to be sent to the responding host
+                while (!queue_empty(packetQueue)) {
+                    char* queueElem = (char*)queue_deq(packetQueue);
+                    struct ether_header* queueElemEthHdr = (struct ether_header*)queueElem;
+                    struct iphdr* queueElemIPHdr = (struct iphdr*)(queueElem + sizeof(struct ether_header));
+
+                    if (queueElemIPHdr->daddr == arp_hdr->spa) {
+                        //obtaining the interface on which the packet will be sent on
+                        int nextHopInterface = getNextHop(queueElemIPHdr->daddr, rtable, rtable_len)->interface;
+                        int packetSize = sizeof(struct ether_header) + ntohs(queueElemIPHdr->tot_len);
+                        
+                        //completing the ethernet header with the destination MAC
+                        memcpy(queueElemEthHdr->ether_dhost, arp_hdr->sha, 6);
+                        get_interface_mac(nextHopInterface, queueElemEthHdr->ether_shost);
+
+                        //forwarding the packet
+                        send_to_link(nextHopInterface, queueElem, packetSize);
+                    }//if packet does not match destination IP, requeue it
+                    else {
+                        queue_enq(auxQueue, queueElem);
+                    }
+
+                    packetQueue = auxQueue;
+                }
+            }
         }
 
         /* Note that packets received are in network order,

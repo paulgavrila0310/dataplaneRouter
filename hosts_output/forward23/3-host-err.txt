@@ -1,9 +1,1 @@
--- No IP packet from router
--- Packet
-###[ Ethernet ]### 
-  dst       = ff:ff:ff:ff:ff:ff
-  src       = de:fe:c8:ed:01:03
-  type      = 0x608
-###[ Raw ]### 
-     load      = '\x8f\x00\x00\x00\x06\x04\x00\x00\xde\xfe\xc8\xed\x01\x03\xc0\xa8\x03\x01\xff\xff\xff\xff\xff\xff\xc0\xa8\x03\x02'
-
+-- No packet received
